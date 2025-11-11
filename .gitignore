@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Venv / Pip / Poetry
+.venv/
+venv/
+pip-wheel-metadata/
+.poetry/
+
+# Logs e temporários
+*.log
+.logs/
+tmp/
+.cache/
+
+# Docker / dotenv
+.env
+.env.local
+.env.*.local
+
+# Frontend
+node_modules/
+dist/
+build/
+
+# IDEs
+.vscode/
+.idea/
+
+# Volumes/dados (ajuste conforme seus volumes)
+data/
+storage/
