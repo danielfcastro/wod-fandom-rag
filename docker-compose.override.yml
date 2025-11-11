@@ -1,0 +1,17 @@
+services:
+  qa:
+    build:
+      context: .
+      dockerfile: Dockerfile.qa
+    env_file: .env
+    ports: ["8000:8000"]
+    depends_on: [opensearch, qdrant, neo4j]
+
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.ui
+    environment:
+      - VITE_QA_BASE_URL=http://qa:8000
+    ports: ["5173:80"]
+    depends_on: [qa]
