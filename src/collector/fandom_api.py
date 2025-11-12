@@ -8,7 +8,6 @@ API_BASE = os.getenv("FANDOM_API_BASE", "https://whitewolf.fandom.com/api.php")
 
 
 def _throttle(delay: float = 0.35) -> None:
-    # respeita limites do Fandom/MediaWiki
     time.sleep(delay)
 
 
@@ -23,7 +22,6 @@ def api_get(params: Dict) -> Dict:
 
 
 def get_parse(title: str) -> Dict:
-    """Retorna wikitext | sections | links | categories da página."""
     return api_get(
         {
             "action": "parse",
@@ -42,14 +40,13 @@ def get_allpages(ap_namespace: int = 0, limit: Optional[int] = None) -> Iterable
     """
     fetched = 0
     apcontinue = None
-
     while True:
         params = {
             "action": "query",
             "list": "allpages",
             "apnamespace": ap_namespace,
-            "aplimit": "max",               # pede o máximo permitido
-            "apfilterredir": "nonredirects" # evita redirects
+            "aplimit": "max",
+            "apfilterredir": "nonredirects",
         }
         if apcontinue:
             params["apcontinue"] = apcontinue
