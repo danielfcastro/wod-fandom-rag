@@ -1,16 +1,36 @@
 # src/collector/ingest_incremental.py
-import os, sys, time, signal, sqlite3, argparse, math, json
+import os
+import sys
+import time
+import signal
+import sqlite3
+import argparse
 from datetime import datetime
-from typing import Iterable, List, Dict, Tuple
+from typing import Iterable, List, Dict, Optional
 
-from .fandom_api import get_allpages, get_parse  # usa o que você já tem
-from .parsers import parse_page_to_passages_and_graph  # supõe função que retorna (passages, nodes, edges)
-from .indexers.opensearch_index import bulk_upsert as os_upsert
-from .indexers.qdrant_index import upsert_vectors as qd_upsert
-from .graph.neo4j_store import upsert_nodes as g_upsert_nodes, upsert_edges as g_upsert_edges
-from .embeddings import embed_passages  # já existe no seu QA (ou ajuste para seu caminho)
-from .utils.text import strip_text  # util sua p/ limpar
+from .fandom_api import get_allpages
+from .run_ingest import process_title  # usa a mesma função do seu fluxo atual
 
+# --- OpenSearch: checar existência por title (keyword) ---
+from opensearchpy import OpenSearch
+OS_URL = os.getenv("OPENSEARCH_URL", "http://opensearch:9200")
+OS_INDEX = os.getenv("OPENSEARCH_INDEX", "passages-wod")
+_os_client = OpenSearch(OS_URL)
+
+def already_indexed_in_os(title: str) -> bool:
+    """
+    Retorna True se já existir qualquer doc com title == <title> no índice.
+    (title é 'keyword' no mapping, então term query casa exato)
+    """
+    try:
+        body = {"query": {"term": {"title": title}}, "size": 0}
+        res = _os_client.search(index=OS_INDEX, body=body)
+        return res.get("hits", {}).get("total", {}).get("value", 0) > 0
+    except Exception:
+        # se OS estiver indisponível, não bloqueia ingestão
+        return False
+
+# --- Checkpoint (SQLite) ---
 DB_PATH = os.getenv("INGEST_DB_PATH", "checkpoints/ingest.db")
 DEFAULT_BATCH = int(os.getenv("INGEST_BATCH_SIZE", "100"))
 MAX_RETRIES = int(os.getenv("INGEST_MAX_RETRIES", "3"))
@@ -38,7 +58,8 @@ CREATE TABLE IF NOT EXISTS meta(
 );
 """
 
-def now_iso(): return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+def now_iso() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 def open_db():
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
@@ -50,75 +71,54 @@ def open_db():
     return con
 
 def meta_set(con, key, value):
-    con.execute("INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+    con.execute(
+        "INSERT INTO meta(key,value) VALUES(?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
     con.commit()
 
 def meta_get(con, key, default=None):
-    cur = con.execute("SELECT value FROM meta WHERE key=?", (key,))
-    row = cur.fetchone()
+    row = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
     return row[0] if row else default
 
-def page_set(con, title, status, err=None, inc_try=False):
-    tries_inc = ", tries=tries+1" if inc_try else ""
+def page_set(con, title, status, err=None, reset_tries=False):
+    tries = 0 if reset_tries else "tries"
+    if reset_tries:
+        con.execute(
+            "INSERT INTO pages(title,status,tries,last_error,updated_at) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(title) DO UPDATE SET status=excluded.status, tries=0, last_error=excluded.last_error, updated_at=excluded.updated_at",
+            (title, status, 0, err, now_iso()),
+        )
+    else:
+        con.execute(
+            "INSERT INTO pages(title,status,tries,last_error,updated_at) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(title) DO UPDATE SET status=excluded.status, last_error=excluded.last_error, updated_at=excluded.updated_at",
+            (title, status, 0, err, now_iso()),
+        )
+
+def page_inc_try(con, title):
     con.execute(
-        f"INSERT INTO pages(title,status,tries,last_error,updated_at) VALUES(?,?,?,?,?) "
-        f"ON CONFLICT(title) DO UPDATE SET status=excluded.status, last_error=excluded.last_error, updated_at=excluded.updated_at{tries_inc}",
-        (title, status, 0, err, now_iso()),
+        "UPDATE pages SET tries=tries+1, updated_at=? WHERE title=?",
+        (now_iso(), title),
     )
 
 def seed_pending(con, titles: Iterable[str]):
-    cur = con.executemany(
+    con.executemany(
         "INSERT OR IGNORE INTO pages(title,status,tries,last_error,updated_at) VALUES(?,?,?,?,?)",
-        [(t, "pending", 0, None, now_iso()) for t in titles]
+        [(t, "pending", 0, None, now_iso()) for t in titles],
     )
     con.commit()
 
-def pending_titles(con, limit) -> List[str]:
+def pending_titles(con, limit: int) -> List[str]:
     cur = con.execute(
-        "SELECT title FROM pages WHERE status IN ('pending','failed') AND tries < ? ORDER BY updated_at LIMIT ?",
-        (MAX_RETRIES, limit)
+        "SELECT title FROM pages WHERE status IN ('pending','failed') AND tries < ? "
+        "ORDER BY updated_at LIMIT ?",
+        (MAX_RETRIES, limit),
     )
     return [r[0] for r in cur.fetchall()]
 
-def backoff(tries: int) -> float:
-    return min(60.0, (2 ** (tries-1))) if tries > 0 else 0.0  # 1s,2s,4s,8s,... até 60s
-
-def ingest_batch(titles: List[str]) -> Tuple[int,int,int]:
-    """Processa um lote de títulos: coleta -> parse -> indexa"""
-    passages_all: List[Dict] = []
-    graph_nodes_all: List[Dict] = []
-    graph_edges_all: List[Dict] = []
-
-    for title in titles:
-        if STOP: break
-        try:
-            parsed = get_parse(title)  # sections, links, categories, wikitext
-            passages, nodes, edges = parse_page_to_passages_and_graph(title, parsed)
-            # limpeza mínima
-            for p in passages: p["text"] = strip_text(p.get("text",""))
-            passages_all.extend(passages)
-            graph_nodes_all.extend(nodes)
-            graph_edges_all.extend(edges)
-            yield ("ok", title, None)
-        except Exception as e:
-            yield ("error", title, repr(e))
-
-    # indexação em lote (se houver algo)
-    if passages_all:
-        # embeddings + vetores + upserts
-        vectors = embed_passages(passages_all)  # retorna List[List[float]] no mesmo ordenamento
-        # OpenSearch: texto/keyword
-        os_upsert(passages_all)
-        # Qdrant: vetores + payloads
-        payloads = [{"title": p["title"], "url": p["url"], "offset": p["offset"]} for p in passages_all]
-        qd_upsert(vectors, payloads)
-
-    if graph_nodes_all:
-        g_upsert_nodes(graph_nodes_all)
-    if graph_edges_all:
-        g_upsert_edges(graph_edges_all)
-
-def run(namespace: int, limit: int, batch_size: int, reset: bool, resume: bool):
+def run(namespace: int, limit: int, batch_size: int, reset: bool, skip_existing_os: bool):
     con = open_db()
     if reset:
         con.execute("DELETE FROM pages")
@@ -128,19 +128,25 @@ def run(namespace: int, limit: int, batch_size: int, reset: bool, resume: bool):
     meta_set(con, "namespace", str(namespace))
     meta_set(con, "started_at", meta_get(con, "started_at", now_iso()))
 
-    # Seeding inicial (apenas se ainda não houver páginas)
-    cur = con.execute("SELECT COUNT(*) FROM pages")
-    count = cur.fetchone()[0]
+    # Seed inicial (só se vazio)
+    count = con.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
     if count == 0:
-        print(f"[seed] listando páginas via allpages (namespace={namespace}) ...", flush=True)
+        print(f"[seed] listando allpages(ns={namespace}) aplimit=max + nonredirects ...", flush=True)
         titles = list(get_allpages(ap_namespace=namespace, limit=limit or None))
-        if limit: titles = titles[:limit]
+        if limit:
+            titles = titles[:limit]
         seed_pending(con, titles)
-        print(f"[seed] {len(titles)} títulos registrados como 'pending'")
+        print(f"[seed] {len(titles)} títulos pendentes")
+
+    def remaining() -> int:
+        return int(
+            con.execute(
+                "SELECT COUNT(*) FROM pages WHERE status IN ('pending','failed') AND tries < ?",
+                (MAX_RETRIES,),
+            ).fetchone()[0]
+        )
 
     total = int(con.execute("SELECT COUNT(*) FROM pages").fetchone()[0])
-    def remaining(): return int(con.execute("SELECT COUNT(*) FROM pages WHERE status IN ('pending','failed') AND tries < ?", (MAX_RETRIES,)).fetchone()[0])
-
     print(f"[stats] total no checkpoint: {total}, pendentes: {remaining()}", flush=True)
 
     processed = 0
@@ -150,41 +156,45 @@ def run(namespace: int, limit: int, batch_size: int, reset: bool, resume: bool):
             print("[done] nada pendente dentro de max_retries — fim.", flush=True)
             break
 
-        # marca tentativa (para backoff) ANTES de processar
-        for t in titles:
-            con.execute("UPDATE pages SET tries=tries+1, updated_at=? WHERE title=?", (now_iso(), t))
-        con.commit()
+        ok = err = skipped = 0
 
-        # backoff por título (pequeno sleep linear só pra espalhar chamadas)
-        time.sleep(0.1)
+        for title in titles:
+            if STOP:
+                break
 
-        ok, err = 0, 0
-        for status, title, maybe_err in ingest_batch(titles):
-            if STOP: break
-            if status == "ok":
-                page_set(con, title, "ok")
+            # marca a tentativa
+            page_inc_try(con, title)
+            con.commit()
+
+            # pula se já existe no OpenSearch
+            if skip_existing_os and already_indexed_in_os(title):
+                page_set(con, title, "skipped", reset_tries=True)
+                skipped += 1
+                continue
+
+            # processa com a mesma função do fluxo atual
+            try:
+                process_title(title)  # parse + index (OS/Qdrant/Neo4j)
+                page_set(con, title, "ok", reset_tries=True)
                 ok += 1
-            else:
-                # volta status='failed', mantém contador tries (já incrementado)
-                page_set(con, title, "failed", err=maybe_err)
-                # pequeno backoff local por título
-                tries = con.execute("SELECT tries FROM pages WHERE title=?", (title,)).fetchone()[0]
-                time.sleep(backoff(tries))
+            except Exception as e:
+                page_set(con, title, "failed", err=repr(e))
                 err += 1
 
         con.commit()
         processed += len(titles)
-        print(f"[batch] ok={ok} err={err} | progresso: {processed}/{total} | pendentes: {remaining()}", flush=True)
+        print(f"[batch] ok={ok} skipped={skipped} err={err} | progresso: {processed}/{total} | pendentes: {remaining()}", flush=True)
 
         if STOP:
             print("[stop] encerrado por sinal — checkpoints salvos.", flush=True)
             break
 
-    print("[summary] status:", flush=True)
     ok_count   = con.execute("SELECT COUNT(*) FROM pages WHERE status='ok'").fetchone()[0]
+    skip_count = con.execute("SELECT COUNT(*) FROM pages WHERE status='skipped'").fetchone()[0]
     fail_count = con.execute("SELECT COUNT(*) FROM pages WHERE status='failed' AND tries>=?", (MAX_RETRIES,)).fetchone()[0]
     pend_count = con.execute("SELECT COUNT(*) FROM pages WHERE status IN ('pending','failed') AND tries<?", (MAX_RETRIES,)).fetchone()[0]
-    print(f"  ok={ok_count}  failed(final)={fail_count}  pendentes(retry)={pend_count}")
+    print(f"[summary] ok={ok_count} skipped={skip_count} failed(final)={fail_count} pend(retry)={pend_count}")
+
 
 def main():
     ap = argparse.ArgumentParser(description="Ingestão incremental e resumível (Fandom WoD).")
@@ -192,14 +202,22 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="Máximo de páginas para seed inicial (0=sem limite)")
     ap.add_argument("--batch-size", type=int, default=DEFAULT_BATCH)
     ap.add_argument("--reset", action="store_true", help="Zera checkpoint (recomeça do zero)")
-    ap.add_argument("--resume", action="store_true", help="Tenta retomar a partir do checkpoint (default)")
     ap.add_argument("--max-retries", type=int, default=MAX_RETRIES)
+    ap.add_argument("--skip-existing-os", action="store_true", default=True, help="Pula títulos que já existem no OpenSearch (default: True)")
     args = ap.parse_args()
 
     global MAX_RETRIES
     MAX_RETRIES = args.max_retries
 
-    run(namespace=args.namespace, limit=args.limit, batch_size=args.batch_size, reset=args.reset, resume=args.resume or True)
+    run(
+        namespace=args.namespace,
+        limit=args.limit,
+        batch_size=args.batch_size,
+        reset=args.reset,
+        skip_existing_os=args.skip_existing_os,
+    )
+
 
 if __name__ == "__main__":
     main()
+
