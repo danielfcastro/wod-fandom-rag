@@ -22,57 +22,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/qa")
-def qa(
-    query: str = Query(..., description="Pergunta do usuário"),
-    top_k: int = Query(6, ge=1, le=50),
-    use_graph: bool = Query(True),
-):
-    """
-    Endpoint principal de QA.
-
-    Retorna:
-      {
-        "query": "...",
-        "passages": [ {title,url,text,score}, ... ],
-        "graph": [ {col: val, ...}, ... ]
-      }
-    """
-    # Busca híbrida (lexical + vetorial se estiver habilitado)
-    candidates = hybrid(query, k_lex=max(top_k * 3, 30), k_vec=0)  # k_vec=0 por enquanto
-
-    # Reordenar (no momento só ordena pelo score mesmo)
-    ranked = rerank(query, candidates, top_k=max(top_k, 10))
-
-    passages = [
-        {
-            "title": d.get("title"),
-            "url": d.get("url"),
-            "text": d.get("text"),
-            "score": float(d.get("score", 0.0)),
-            "section": d.get("section"),
-        }
-        for d in ranked[:top_k]
-    ]
-
-    graph_rows: List[Dict[str, Any]] = []
-    if use_graph:
-        # Aqui você pode sofisticar com matching de entidades etc.
-        # Por enquanto: se a query mencionar "Ventrue", rodamos um exemplo simples.
-        if "ventrue" in query.lower():
-            cypher = """
-            MATCH (c:Entity {type:"Clan"})-[:REL {rel:"HAS_DISCIPLINE"}]->(d:Entity {type:"Discipline"})
-            WHERE c.id = "Ventrue"
-            RETURN c.id AS clan, collect(d.id)[0..10] AS disciplines
-            """
-            graph_rows = run_cypher(cypher)
-
-    return {
-        "query": query,
-        "passages": passages,
-        "graph": graph_rows,
-    }
-
 @app.get("/graph")
 def graph(query: str = Query(..., description="Cypher read-only")):
     """
@@ -80,3 +29,55 @@ def graph(query: str = Query(..., description="Cypher read-only")):
     """
     rows = run_cypher(query)
     return {"query": query, "rows": rows}
+
+@app.get("/qa")
+def qa(
+    query: str,
+    top_k: int = 5,
+    use_graph: bool = True,
+):
+    # --- BUSCA HÍBRIDA (já existia) ---
+    passages = hybrid(query, k_lex=max(top_k, 10), k_vec=max(top_k, 10))
+
+    # --- GRAFO (já existia) ---
+    graph_rows: list[dict] = []
+    if use_graph:
+        # seja lá como você já está preenchendo graph_rows,
+        # mantém essa parte exatamente igual:
+        graph_rows = run_cypher(
+            """
+            MATCH (c:Entity {type:"Clan"})-[:REL {rel:"HAS_DISCIPLINE"}]->(d:Entity {type:"Discipline"})
+            RETURN c.id AS clan, collect(d.id)[0..5] AS disciplines
+            LIMIT 10
+            """
+        )
+
+    # --------- NOVO: montar 'answer' pra UI ---------
+
+    graph_answer = None
+    if graph_rows:
+        first = graph_rows[0]
+        clan = first.get("clan") or first.get("id") or first.get("name")
+        discs = first.get("disciplines") or first.get("sample")
+
+        if isinstance(discs, list):
+            discs_str = ", ".join(discs)
+        else:
+            discs_str = str(discs) if discs is not None else ""
+
+        if clan and discs_str:
+            graph_answer = f"As disciplinas de {clan} são: {discs_str}."
+
+    passage_answer = None
+    if passages:
+        # melhor trecho textual, caso o grafo não resolva
+        passage_answer = passages[0]["text"]
+
+    answer = graph_answer or passage_answer or ""
+
+    return {
+        "query": query,
+        "answer": answer,
+        "passages": passages,
+        "graph": graph_rows,
+    }
