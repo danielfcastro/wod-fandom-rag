@@ -1,21 +1,21 @@
 # src/collector/ingest_incremental.py
 import os
-import sys
-import time
 import signal
 import sqlite3
 import argparse
 from datetime import datetime
-from typing import Iterable, List, Dict, Optional
+from typing import Iterable, List
 
-from .fandom_api import get_allpages
-from .run_ingest import process_title  # usa a mesma função do seu fluxo atual
+from .fandom_api import iter_allpages
+from .run_ingest import ingest_title  # usa o mesmo fluxo de ingestão de 1 título
 
 # --- OpenSearch: checar existência por title (keyword) ---
 from opensearchpy import OpenSearch
+
 OS_URL = os.getenv("OPENSEARCH_URL", "http://opensearch:9200")
 OS_INDEX = os.getenv("OPENSEARCH_INDEX", "passages-wod")
 _os_client = OpenSearch(OS_URL)
+
 
 def already_indexed_in_os(title: str) -> bool:
     """
@@ -30,15 +30,20 @@ def already_indexed_in_os(title: str) -> bool:
         # se OS estiver indisponível, não bloqueia ingestão
         return False
 
+
 # --- Checkpoint (SQLite) ---
 DB_PATH = os.getenv("INGEST_DB_PATH", "checkpoints/ingest.db")
 DEFAULT_BATCH = int(os.getenv("INGEST_BATCH_SIZE", "100"))
-MAX_RETRIES = int(os.getenv("INGEST_MAX_RETRIES", "3"))
+DEFAULT_MAX_RETRIES = int(os.getenv("INGEST_MAX_RETRIES", "3"))
 
 STOP = False
+
+
 def _signal_handler(signum, frame):
     global STOP
     STOP = True
+
+
 signal.signal(signal.SIGINT, _signal_handler)
 signal.signal(signal.SIGTERM, _signal_handler)
 
@@ -51,6 +56,7 @@ CREATE TABLE IF NOT EXISTS pages(
   updated_at TEXT NOT NULL
 );
 """
+
 DDL_META = """
 CREATE TABLE IF NOT EXISTS meta(
   key TEXT PRIMARY KEY,
@@ -58,10 +64,13 @@ CREATE TABLE IF NOT EXISTS meta(
 );
 """
 
+
 def now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
+
 def open_db():
+    # garante diretório
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     con = sqlite3.connect(DB_PATH)
     con.execute("PRAGMA journal_mode=WAL;")
@@ -69,6 +78,7 @@ def open_db():
     con.execute(DDL_META)
     con.commit()
     return con
+
 
 def meta_set(con, key, value):
     con.execute(
@@ -78,24 +88,39 @@ def meta_set(con, key, value):
     )
     con.commit()
 
+
 def meta_get(con, key, default=None):
     row = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
     return row[0] if row else default
 
+
 def page_set(con, title, status, err=None, reset_tries=False):
-    tries = 0 if reset_tries else "tries"
     if reset_tries:
         con.execute(
-            "INSERT INTO pages(title,status,tries,last_error,updated_at) VALUES(?,?,?,?,?) "
-            "ON CONFLICT(title) DO UPDATE SET status=excluded.status, tries=0, last_error=excluded.last_error, updated_at=excluded.updated_at",
+            """
+            INSERT INTO pages(title,status,tries,last_error,updated_at)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(title) DO UPDATE SET
+              status=excluded.status,
+              tries=0,
+              last_error=excluded.last_error,
+              updated_at=excluded.updated_at
+            """,
             (title, status, 0, err, now_iso()),
         )
     else:
         con.execute(
-            "INSERT INTO pages(title,status,tries,last_error,updated_at) VALUES(?,?,?,?,?) "
-            "ON CONFLICT(title) DO UPDATE SET status=excluded.status, last_error=excluded.last_error, updated_at=excluded.updated_at",
+            """
+            INSERT INTO pages(title,status,tries,last_error,updated_at)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(title) DO UPDATE SET
+              status=excluded.status,
+              last_error=excluded.last_error,
+              updated_at=excluded.updated_at
+            """,
             (title, status, 0, err, now_iso()),
         )
+
 
 def page_inc_try(con, title):
     con.execute(
@@ -103,24 +128,42 @@ def page_inc_try(con, title):
         (now_iso(), title),
     )
 
+
 def seed_pending(con, titles: Iterable[str]):
     con.executemany(
-        "INSERT OR IGNORE INTO pages(title,status,tries,last_error,updated_at) VALUES(?,?,?,?,?)",
+        "INSERT OR IGNORE INTO pages(title,status,tries,last_error,updated_at) "
+        "VALUES(?,?,?,?,?)",
         [(t, "pending", 0, None, now_iso()) for t in titles],
     )
     con.commit()
 
-def pending_titles(con, limit: int) -> List[str]:
+
+def pending_titles(con, limit: int, max_retries: int) -> List[str]:
     cur = con.execute(
-        "SELECT title FROM pages WHERE status IN ('pending','failed') AND tries < ? "
-        "ORDER BY updated_at LIMIT ?",
-        (MAX_RETRIES, limit),
+        """
+        SELECT title
+        FROM pages
+        WHERE status IN ('pending','failed')
+          AND tries < ?
+        ORDER BY updated_at
+        LIMIT ?
+        """,
+        (max_retries, limit),
     )
     return [r[0] for r in cur.fetchall()]
 
-def run(namespace: int, limit: int, batch_size: int, reset: bool, skip_existing_os: bool):
+
+def run(
+    namespace: int,
+    limit: int,
+    batch_size: int,
+    reset: bool,
+    skip_existing_os: bool,
+    max_retries: int,
+):
     con = open_db()
     if reset:
+        print("[reset] limpando checkpoint (tabelas pages/meta)...", flush=True)
         con.execute("DELETE FROM pages")
         con.execute("DELETE FROM meta")
         con.commit()
@@ -131,29 +174,43 @@ def run(namespace: int, limit: int, batch_size: int, reset: bool, skip_existing_
     # Seed inicial (só se vazio)
     count = con.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
     if count == 0:
-        print(f"[seed] listando allpages(ns={namespace}) aplimit=max + nonredirects ...", flush=True)
-        titles = list(get_allpages(ap_namespace=namespace, limit=limit or None))
+        print(
+            f"[seed] listando allpages(ns={namespace}) aplimit=max + nonredirects ...",
+            flush=True,
+        )
+        titles = list(iter_allpages(ap_namespace=namespace, limit=limit or None))
         if limit:
             titles = titles[:limit]
         seed_pending(con, titles)
-        print(f"[seed] {len(titles)} títulos pendentes")
+        print(f"[seed] {len(titles)} títulos pendentes", flush=True)
 
     def remaining() -> int:
         return int(
             con.execute(
-                "SELECT COUNT(*) FROM pages WHERE status IN ('pending','failed') AND tries < ?",
-                (MAX_RETRIES,),
+                """
+                SELECT COUNT(*)
+                FROM pages
+                WHERE status IN ('pending','failed')
+                  AND tries < ?
+                """,
+                (max_retries,),
             ).fetchone()[0]
         )
 
     total = int(con.execute("SELECT COUNT(*) FROM pages").fetchone()[0])
-    print(f"[stats] total no checkpoint: {total}, pendentes: {remaining()}", flush=True)
+    print(
+        f"[stats] total no checkpoint: {total}, pendentes: {remaining()} (max_retries={max_retries})",
+        flush=True,
+    )
 
     processed = 0
     while not STOP:
-        titles = pending_titles(con, batch_size)
+        titles = pending_titles(con, batch_size, max_retries)
         if not titles:
-            print("[done] nada pendente dentro de max_retries — fim.", flush=True)
+            print(
+                "[done] nada pendente dentro de max_retries — fim.",
+                flush=True,
+            )
             break
 
         ok = err = skipped = 0
@@ -172,9 +229,9 @@ def run(namespace: int, limit: int, batch_size: int, reset: bool, skip_existing_
                 skipped += 1
                 continue
 
-            # processa com a mesma função do fluxo atual
             try:
-                process_title(title)  # parse + index (OS/Qdrant/Neo4j)
+                # usa o mesmo fluxo de ingestão de 1 título
+                ingest_title(title)
                 page_set(con, title, "ok", reset_tries=True)
                 ok += 1
             except Exception as e:
@@ -183,31 +240,78 @@ def run(namespace: int, limit: int, batch_size: int, reset: bool, skip_existing_
 
         con.commit()
         processed += len(titles)
-        print(f"[batch] ok={ok} skipped={skipped} err={err} | progresso: {processed}/{total} | pendentes: {remaining()}", flush=True)
+        print(
+            f"[batch] ok={ok} skipped={skipped} err={err} | "
+            f"progresso: {processed}/{total} | pendentes: {remaining()}",
+            flush=True,
+        )
 
         if STOP:
             print("[stop] encerrado por sinal — checkpoints salvos.", flush=True)
             break
 
-    ok_count   = con.execute("SELECT COUNT(*) FROM pages WHERE status='ok'").fetchone()[0]
-    skip_count = con.execute("SELECT COUNT(*) FROM pages WHERE status='skipped'").fetchone()[0]
-    fail_count = con.execute("SELECT COUNT(*) FROM pages WHERE status='failed' AND tries>=?", (MAX_RETRIES,)).fetchone()[0]
-    pend_count = con.execute("SELECT COUNT(*) FROM pages WHERE status IN ('pending','failed') AND tries<?", (MAX_RETRIES,)).fetchone()[0]
-    print(f"[summary] ok={ok_count} skipped={skip_count} failed(final)={fail_count} pend(retry)={pend_count}")
+    ok_count = con.execute(
+        "SELECT COUNT(*) FROM pages WHERE status='ok'"
+    ).fetchone()[0]
+    skip_count = con.execute(
+        "SELECT COUNT(*) FROM pages WHERE status='skipped'"
+    ).fetchone()[0]
+    fail_count = con.execute(
+        "SELECT COUNT(*) FROM pages WHERE status='failed' AND tries>=?",
+        (max_retries,),
+    ).fetchone()[0]
+    pend_count = con.execute(
+        "SELECT COUNT(*) FROM pages WHERE status IN ('pending','failed') AND tries<?",
+        (max_retries,),
+    ).fetchone()[0]
+
+    print(
+        f"[summary] ok={ok_count} skipped={skip_count} "
+        f"failed(final)={fail_count} pend(retry)={pend_count}",
+        flush=True,
+    )
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Ingestão incremental e resumível (Fandom WoD).")
-    ap.add_argument("--namespace", "--ap-namespace", type=int, default=0, help="MediaWiki namespace (0=artigos)")
-    ap.add_argument("--limit", type=int, default=0, help="Máximo de páginas para seed inicial (0=sem limite)")
-    ap.add_argument("--batch-size", type=int, default=DEFAULT_BATCH)
-    ap.add_argument("--reset", action="store_true", help="Zera checkpoint (recomeça do zero)")
-    ap.add_argument("--max-retries", type=int, default=MAX_RETRIES)
-    ap.add_argument("--skip-existing-os", action="store_true", default=True, help="Pula títulos que já existem no OpenSearch (default: True)")
+    ap = argparse.ArgumentParser(
+        description="Ingestão incremental e resumível (Fandom WoD)."
+    )
+    ap.add_argument(
+        "--namespace",
+        "--ap-namespace",
+        type=int,
+        default=0,
+        help="MediaWiki namespace (0=artigos)",
+    )
+    ap.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Máximo de páginas para seed inicial (0=sem limite)",
+    )
+    ap.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH,
+    )
+    ap.add_argument(
+        "--reset",
+        action="store_true",
+        help="Zera checkpoint (recomeça do zero)",
+    )
+    ap.add_argument(
+        "--max-retries",
+        type=int,
+        default=DEFAULT_MAX_RETRIES,
+        help=f"Máximo de tentativas por página (default={DEFAULT_MAX_RETRIES})",
+    )
+    ap.add_argument(
+        "--skip-existing-os",
+        action="store_true",
+        default=True,
+        help="Pula títulos que já existem no OpenSearch (default: True)",
+    )
     args = ap.parse_args()
-
-    global MAX_RETRIES
-    MAX_RETRIES = args.max_retries
 
     run(
         namespace=args.namespace,
@@ -215,9 +319,9 @@ def main():
         batch_size=args.batch_size,
         reset=args.reset,
         skip_existing_os=args.skip_existing_os,
+        max_retries=args.max_retries,
     )
 
 
 if __name__ == "__main__":
     main()
-

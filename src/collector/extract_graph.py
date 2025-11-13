@@ -1,18 +1,19 @@
+# src/collector/extract_graph.py
+from typing import Any, Dict, List
 
-from typing import Dict, List
-from .parsers import guess_entity_type
-import re
+def extract(*args: Any, **kwargs: Any) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Placeholder para extração de grafo a partir dos textos.
 
-def to_id(name: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
+    Ele existe só para manter compatibilidade com run_ingest.py:
+      from .extract_graph import extract as extract_graph
 
-def build_node(title: str, cats: List[str], aliases: List[str] = None, line: str = None, editions: List[str] = None, url: str = None) -> Dict:
-    return {
-        "id": to_id(title),
-        "type": guess_entity_type(title, cats),
-        "name": title,
-        "aliases": aliases or [],
-        "line": line,
-        "edition": editions or [],
-        "source": url,
-    }
+    Qualquer que seja a chamada (por exemplo:
+        extract(passage)
+        extract(title, full_text)
+    )
+    essa função:
+      - não levanta erro
+      - simplesmente diz "não achei nenhum nó/aresta novo".
+    """
+    return {"nodes": [], "edges": []}
