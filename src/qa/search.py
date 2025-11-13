@@ -1,122 +1,66 @@
 # src/qa/search.py
 import os
-from opensearchpy import OpenSearch
-from opensearchpy.exceptions import NotFoundError
+from typing import List, Dict
 
-# ---------------------------------------------------------------------------
-# Configurações do OpenSearch
-# ---------------------------------------------------------------------------
-OPENSEARCH_URL = os.getenv("OPENSEARCH_URL", "http://opensearch:9200")
+from opensearchpy import OpenSearch
+from qdrant_client import QdrantClient, models
+from sentence_transformers import SentenceTransformer
+
+OPENSEARCH_URL   = os.getenv("OPENSEARCH_URL", "http://opensearch:9200")
 OPENSEARCH_INDEX = os.getenv("OPENSEARCH_INDEX", "passages-wod")
 
+QDRANT_URL        = os.getenv("QDRANT_URL", "http://qdrant:6333")
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "passages-wod")
+EMBEDDING_MODEL   = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+
 os_client = OpenSearch(OPENSEARCH_URL)
+qdrant    = QdrantClient(url=QDRANT_URL, prefer_grpc=False, check_compatibility=False)
+_model    = SentenceTransformer(EMBEDDING_MODEL)
 
-# ---------------------------------------------------------------------------
-# Garante que o índice existe
-# ---------------------------------------------------------------------------
-try:
-    # Importa a função que define o mapping usado pelo coletor
-    from src.collector.indexers.opensearch_index import ensure_index
-    ensure_index()
-except Exception as e:
-    print(f"[WARN] não foi possível garantir o índice no startup: {e}")
+def lexical_search(query: str, k: int) -> List[Dict]:
+    res = os_client.search(index=OPENSEARCH_INDEX, body={
+        "size": k,
+        "query": {"multi_match": {"query": query, "fields": ["title^2", "text"]}},
+        "_source": ["title", "section", "url", "text", "offset"]
+    })
+    hits = res.get("hits", {}).get("hits", [])
+    out = []
+    for h in hits:
+        s = h.get("_source", {})
+        out.append({
+            "title": s.get("title"),
+            "section": s.get("section"),
+            "url": s.get("url"),
+            "text": s.get("text"),
+            "offset": s.get("offset"),
+            "score": h.get("_score", 0.0),
+            "source": "lexical"
+        })
+    return out
 
-# ---------------------------------------------------------------------------
-# Funções de busca
-# ---------------------------------------------------------------------------
+def vector_search(query: str, k: int) -> List[Dict]:
+    # Agora via Qdrant (nada de kNN no OpenSearch)
+    vec = _model.encode([query], normalize_embeddings=True)[0].tolist()
+    res = qdrant.search(
+        collection_name=QDRANT_COLLECTION,
+        query_vector=vec,
+        limit=k,
+        with_payload=True
+    )
+    out = []
+    for p in res:
+        payload = p.payload or {}
+        out.append({
+            "title": payload.get("title"),
+            "section": payload.get("section"),
+            "url": payload.get("url"),
+            "text": None,  # opcional carregar texto completo
+            "offset": payload.get("offset"),
+            "score": float(p.score or 0.0),
+            "source": "vector"
+        })
+    return out
 
-def lexical_search(query: str, k: int):
-    """
-    Busca lexical (texto exato e relevância TF-IDF-like)
-    """
-    try:
-        res = os_client.search(
-            index=OPENSEARCH_INDEX,
-            body={
-                "size": k,
-                "query": {
-                    "multi_match": {
-                        "query": query,
-                        "fields": ["title^3", "section^2", "text"],
-                    }
-                },
-            },
-        )
-        hits = res.get("hits", {}).get("hits", [])
-        return [
-            {**hit["_source"], "_score": hit.get("_score", 0.0)} for hit in hits
-        ]
-    except NotFoundError:
-        print(f"[WARN] índice {OPENSEARCH_INDEX} não encontrado — criando...")
-        try:
-            ensure_index()
-        except Exception as e:
-            print(f"[ERRO] não foi possível criar o índice: {e}")
-        return []
-    except Exception as e:
-        print(f"[ERRO] lexical_search falhou: {e}")
-        return []
-
-
-def vector_search(query: str, k: int):
-    """
-    Busca vetorial (semantic search).
-    Depende de embeddings já armazenados no OpenSearch.
-    """
-    try:
-        res = os_client.search(
-            index=OPENSEARCH_INDEX,
-            body={
-                "size": k,
-                "query": {
-                    "knn": {
-                        "embedding": {
-                            "vector": [],  # o vetor é preenchido na camada superior
-                            "k": k,
-                        }
-                    }
-                },
-            },
-        )
-        hits = res.get("hits", {}).get("hits", [])
-        return [
-            {**hit["_source"], "_score": hit.get("_score", 0.0)} for hit in hits
-        ]
-    except NotFoundError:
-        print(f"[WARN] índice {OPENSEARCH_INDEX} não encontrado — criando...")
-        try:
-            ensure_index()
-        except Exception as e:
-            print(f"[ERRO] não foi possível criar o índice: {e}")
-        return []
-    except Exception as e:
-        print(f"[ERRO] vector_search falhou: {e}")
-        return []
-
-
-def hybrid(query: str, k_lex: int = 30, k_vec: int = 30):
-    """
-    Combina resultados lexicais e vetoriais.
-    Retorna uma lista de documentos únicos, ordenados por score combinado.
-    """
-    try:
-        docs_lex = lexical_search(query, k_lex)
-        docs_vec = vector_search(query, k_vec)
-
-        seen = {}
-        for doc in docs_lex + docs_vec:
-            _id = doc.get("id") or doc.get("title")
-            if not _id:
-                continue
-            if _id not in seen:
-                seen[_id] = doc
-            else:
-                seen[_id]["_score"] += doc.get("_score", 0.0)
-
-        return sorted(
-            seen.values(), key=lambda x: x.get("_score", 0.0), reverse=True
-        )
-
-    except Exception as e:
-        print(f"[ERRO] hybrid search falhou: {e}")
-        return []
+def hybrid(query: str, k_lex: int, k_vec: int) -> List[Dict]:
+    # concatena resultados; o reranker (se ativo) cuida da ordenação depois
+    return lexical_search(query, k_lex) + vector_search(query, k_vec)
