@@ -1,43 +1,30 @@
 # src/collector/fandom_api.py
-import os
-import time
-import requests
-from typing import Dict, Iterable, Optional
+import os, time, requests
+from typing import Dict, Iterator, Optional
 
 API_BASE = os.getenv("FANDOM_API_BASE", "https://whitewolf.fandom.com/api.php")
 
-
-def _throttle(delay: float = 0.35) -> None:
+def _throttle(delay: float = 0.35):
     time.sleep(delay)
 
-
-def api_get(params: Dict) -> Dict:
+def api_get(params: Dict):
     _throttle()
-    q = dict(params)
-    q.setdefault("format", "json")
-    q.setdefault("formatversion", "2")
-    r = requests.get(API_BASE, params=q, timeout=30)
+    params = dict(params)
+    params.setdefault("format", "json")
+    params.setdefault("formatversion", "2")
+    r = requests.get(API_BASE, params=params, timeout=30)
     r.raise_for_status()
     return r.json()
 
+def get_parse(title: str):
+    return api_get({
+        "action": "parse",
+        "page": title,
+        "prop": "wikitext|sections|links|categories",
+        "redirects": 1,
+    })
 
-def get_parse(title: str) -> Dict:
-    return api_get(
-        {
-            "action": "parse",
-            "page": title,
-            "prop": "wikitext|sections|links|categories",
-            "redirects": 1,
-        }
-    )
-
-
-def get_allpages(ap_namespace: int = 0, limit: Optional[int] = None) -> Iterable[str]:
-    """
-    Itera *todas* as páginas do namespace (sem redirects),
-    usando aplimit=max e seguindo apcontinue até o fim.
-    Se 'limit' for fornecido, corta após N títulos.
-    """
+def iter_allpages(ap_namespace: int = 0, limit: Optional[int] = None) -> Iterator[str]:
     fetched = 0
     apcontinue = None
     while True:
