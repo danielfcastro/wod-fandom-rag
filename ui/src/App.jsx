@@ -1,69 +1,102 @@
+// ui/src/App.jsx
+import { useState } from 'react'
+import { askQA, queryGraph } from './api'
+import SearchBar from './components/SearchBar'
+import ResultCard from './components/ResultCard'
+import GraphView from './components/GraphView'
+import './styles.css'
 
-import React, { useState } from 'react'
-import SearchBar from './components/SearchBar.jsx'
-import ResultCard from './components/ResultCard.jsx'
-import GraphView from './components/GraphView.jsx'
-import AdminPanel from './components/AdminPanel.jsx'
-import { askQA, queryGraph } from './api.js'
+function App() {
+  const [lastQuery, setLastQuery] = useState('')
+  const [results, setResults] = useState([])
+  const [graphRows, setGraphRows] = useState([])
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState(null)
 
-export default function App() {
-  const [q,setQ]=useState('')
-  const [loading,setLoading]=useState(false)
-  const [answers,setAnswers]=useState([])
-  const [graph,setGraph]=useState([])
-  const [cypher,setCypher]=useState('MATCH (c:Entity {type:"Clan"})-[:REL {rel:"HAS_DISCIPLINE"}]->(d:Entity {type:"Discipline"}) RETURN c.name AS clan, collect(d.name)[0..5] AS sample LIMIT 10')
-  const [rows,setRows]=useState([])
+  const handleSearch = async (query, top_k = 6, use_graph = true) => {
+    setLoading(true)
+    setError(null)
+    try {
+      const data = await askQA(query, top_k, use_graph)
+      setLastQuery(data.query || query)
+      setResults(data.passages || [])
+      setGraphRows(use_graph ? (data.graph || []) : [])
+    } catch (e) {
+      console.error(e)
+      setError(e.message || 'Erro ao buscar')
+    } finally {
+      setLoading(false)
+    }
+  }
 
-  const run = async ()=>{ setLoading(true); try{ const r=await askQA(q,6,true); setAnswers(r.answers||[]); setGraph(r.graph||[]) } finally{ setLoading(false) } }
-  const runCypher = async ()=>{ const r=await queryGraph(cypher); setRows(r.rows||[]) }
+  const handleGraphExecute = async (cypher) => {
+    setError(null)
+    try {
+      const data = await queryGraph(cypher)
+      setGraphRows(data.rows || [])
+    } catch (e) {
+      console.error(e)
+      setError(e.message || 'Erro ao consultar o grafo')
+    }
+  }
 
   return (
-    <div className="max-w-5xl mx-auto p-6 space-y-6">
-      <header className="space-y-2">
-        <h1 className="text-3xl font-bold">World of Darkness — RAG UI</h1>
-        <p className="text-slate-400">Busca híbrida + re-ranker + grafo leve (Fandom)</p>
-      </header>
+    <div className="min-h-screen bg-slate-950 text-slate-100">
+      <div className="max-w-6xl mx-auto py-6 px-4 flex flex-col gap-4">
+        <header className="flex items-center justify-between gap-4">
+          <div>
+            <h1 className="text-2xl font-bold">WoD Fandom RAG</h1>
+            <p className="text-sm text-slate-400">
+              Pergunte sobre World of Darkness, com busca híbrida + grafo Neo4j.
+            </p>
+          </div>
+        </header>
 
-      <section className="space-y-3">
-        <SearchBar value={q} onChange={setQ} onSubmit={run} loading={loading} />
-        {graph?.length>0 && <GraphView data={graph} />}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {answers.map((a,i)=><ResultCard key={i} item={a} />)}
-        </div>
-      </section>
+        <SearchBar onSearch={handleSearch} />
 
-      <section className="space-y-3">
-        <h2 className="text-xl font-semibold">Consulta ao Grafo (Cypher, read-only)</h2>
-        <textarea className="input h-28" value={cypher} onChange={e=>setCypher(e.target.value)} />
-        <button className="btn" onClick={runCypher}>Executar</button>
-        {rows.length>0 && (
-          <div className="card overflow-x-auto">
-            <table className="min-w-full text-sm">
-              <thead className="text-slate-400">
-                <tr>{Object.keys(rows[0]||{}).map(h=><th key={h} className="text-left pr-4 pb-2">{h}</th>)}</tr>
-              </thead>
-              <tbody>
-                {rows.map((r,i)=>(
-                  <tr key={i}>{Object.keys(rows[0]||{}).map(h=><td key={h} className="pr-4 py-1">{JSON.stringify(r[h])}</td>)}</tr>
-                ))}
-              </tbody>
-            </table>
+        {error && (
+          <div className="p-3 rounded-lg bg-red-900/40 border border-red-700 text-sm">
+            {error}
           </div>
         )}
-      </section>
 
-      <section className="space-y-3">
-        <details className="card">
-          <summary className="cursor-pointer">Admin (revisão de arestas)</summary>
-          <div className="mt-3">
-            <AdminPanel />
+        {loading && (
+          <div className="text-sm text-slate-300">
+            Buscando resultados...
           </div>
-        </details>
-      </section>
+        )}
 
-      <footer className="text-slate-500 text-sm">
-        <p>Licenças: Fandom (CC BY-SA). Projeto educacional / protótipo.</p>
-      </footer>
+        {lastQuery && (
+          <p className="text-xs text-slate-400">
+            Última pergunta: <span className="text-slate-200">{lastQuery}</span>
+          </p>
+        )}
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-start">
+          <section className="flex flex-col gap-3">
+            <h2 className="text-sm font-semibold text-slate-300 uppercase tracking-wide">
+              Passagens encontradas
+            </h2>
+            {results.length === 0 && !loading && (
+              <p className="text-sm text-slate-500">
+                Nenhum resultado ainda. Faça uma pergunta acima.
+              </p>
+            )}
+            {results.map((p, idx) => (
+              <ResultCard key={idx} passage={p} />
+            ))}
+          </section>
+
+          <section className="flex flex-col gap-3">
+            <h2 className="text-sm font-semibold text-slate-300 uppercase tracking-wide">
+              Consulta ao grafo (Cypher, read-only)
+            </h2>
+            <GraphView onExecute={handleGraphExecute} rows={graphRows} />
+          </section>
+        </div>
+      </div>
     </div>
   )
 }
+
+export default App

@@ -1,58 +1,111 @@
 # src/qa/search.py
 import os
 from typing import List, Dict
-from .settings import OPENSEARCH_INDEX
-from .embeddings import embed_query
-from .reranker import maybe_rerank
-from opensearchpy import OpenSearch
+from opensearchpy import OpenSearch, RequestsHttpConnection
 
-OS_URL = os.getenv("OPENSEARCH_URL", "http://opensearch:9200")
-INDEX = OPENSEARCH_INDEX
-os_client = OpenSearch(OS_URL, verify_certs=False, ssl_show_warn=False)
+OPENSEARCH_URL = os.getenv("OPENSEARCH_URL", "http://opensearch:9200")
+OPENSEARCH_INDEX = os.getenv("OPENSEARCH_INDEX", "passages-wod")
 
-def lexical_search(query: str, k: int) -> List[Dict]:
-    res = os_client.search(
-        index=INDEX,
-        body={
-            "size": k,
-            "query": {"match": {"text": {"query": query}}},
-            "_source": ["title", "section", "url", "text", "offset"]
+os_client = OpenSearch(
+    hosts=[OPENSEARCH_URL],
+    http_compress=True,
+    use_ssl=False,
+    verify_certs=False,
+    connection_class=RequestsHttpConnection,
+)
+
+_USE_VECTOR = True  # será desativado em runtime se der erro
+
+def lexical_search(query: str, k_lex: int = 30) -> List[Dict]:
+    body = {
+        "query": {
+            "multi_match": {
+                "query": query,
+                "fields": ["text^3", "title^2", "section"]
+            }
         },
-    )
-    out = []
-    for hit in res.get("hits", {}).get("hits", []):
-        src = hit.get("_source", {})
-        src["_score"] = hit.get("_score", 0.0)
-        out.append(src)
-    return out
+        "_source": ["title", "url", "text", "section"],
+        "size": k_lex,
+    }
+    res = os_client.search(index=OPENSEARCH_INDEX, body=body)
+    hits = res.get("hits", {}).get("hits", [])
+    docs: List[Dict] = []
+    for h in hits:
+        src = h.get("_source", {})
+        docs.append({
+            "title": src.get("title"),
+            "url": src.get("url"),
+            "text": src.get("text"),
+            "section": src.get("section"),
+            "score": h.get("_score", 0.0),
+            "source_type": "lexical",
+        })
+    return docs
 
-def vector_search(query: str, k: int) -> List[Dict]:
+def vector_search(query: str, k_vec: int = 30) -> List[Dict]:
+    """
+    Tentativa de KNN. Se falhar (campo 'vector' não é knn_vector, etc),
+    desativa permanentemente a busca vetorial e passa a retornar [].
+    """
+    global _USE_VECTOR
+    if not _USE_VECTOR or k_vec <= 0:
+        return []
+
     try:
-        vec = embed_query(query)
+        # Aqui só é útil se o índice tiver 'vector' como knn_vector.
+        # Como o teu índice hoje não está assim, isso vai falhar uma vez e desativar.
         body = {
-            "size": k,
-            "query": {"knn": {"vector": {"vector": vec, "k": k}}},
-            "_source": ["title", "section", "url", "text", "offset"]
+            "size": k_vec,
+            "query": {
+                "neural": {
+                    "vector": {
+                        "query_text": query,
+                    }
+                }
+            },
+            "_source": ["title", "url", "text", "section"],
         }
-        res = os_client.search(index=INDEX, body=body)
-        out = []
-        for hit in res.get("hits", {}).get("hits", []):
-            src = hit.get("_source", {})
-            src["_score"] = hit.get("_score", 0.0)
-            out.append(src)
-        return out
+        res = os_client.search(index=OPENSEARCH_INDEX, body=body)
+        hits = res.get("hits", {}).get("hits", [])
+        docs: List[Dict] = []
+        for h in hits:
+            src = h.get("_source", {})
+            docs.append({
+                "title": src.get("title"),
+                "url": src.get("url"),
+                "text": src.get("text"),
+                "section": src.get("section"),
+                "score": h.get("_score", 0.0),
+                "source_type": "vector",
+            })
+        return docs
     except Exception as e:
         print(f"[WARN] vector_search desativado: {e}")
+        _USE_VECTOR = False
         return []
 
 def hybrid(query: str, k_lex: int = 30, k_vec: int = 30) -> List[Dict]:
-    lex = lexical_search(query, k_lex)
-    vec = vector_search(query, k_vec)
-    dedup, seen = [], set()
-    for item in lex + vec:
-        key = (item.get("title"), item.get("offset"))
-        if key in seen: 
-            continue
-        seen.add(key)
-        dedup.append(item)
-    return maybe_rerank(query, dedup, top_k=min(len(dedup), k_lex))
+    """
+    Combina lexical + vetorial, de-duplica por (title, url, section) e ordena por score desc.
+    """
+    docs = []
+    try:
+        docs.extend(lexical_search(query, k_lex))
+    except Exception as e:
+        print(f"[ERRO] lexical_search falhou: {e}")
+
+    try:
+        docs.extend(vector_search(query, k_vec))
+    except Exception as e:
+        print(f"[ERRO] vector_search falhou: {e}")
+
+    # De-duplicação
+    seen = {}
+    for d in docs:
+        key = (d.get("title"), d.get("url"), d.get("section"))
+        score = float(d.get("score", 0.0))
+        if key not in seen or score > float(seen[key].get("score", 0.0)):
+            seen[key] = d
+
+    final = sorted(seen.values(), key=lambda d: float(d.get("score", 0.0)), reverse=True)
+    return final

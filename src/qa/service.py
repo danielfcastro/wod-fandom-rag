@@ -1,64 +1,82 @@
-
-from fastapi import FastAPI, Query, Header, HTTPException
+# src/qa/service.py
+import os
+from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict, Any
+
 from .search import hybrid
 from .reranker import rerank
-from .graph_queries import related_disciplines, factions_of_clan, driver
-from .settings import ADMIN_TOKEN
+from .graph_queries import run_cypher
 
-app = FastAPI(title="WoD Fandom RAG - QA Service", version="1.0")
+QA_HOST = os.getenv("QA_HOST", "0.0.0.0")
+QA_PORT = int(os.getenv("QA_PORT", "8000"))
 
-@app.get("/health")
-def health(): return {"ok": True}
+app = FastAPI(title="WoD Fandom RAG")
+
+# CORS liberado para dev (localhost:5173)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # em produção você pode restringir
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/qa")
-def qa(query: str = Query(..., description="Pergunta do usuário"),
-       top_k: int = 5, use_graph: bool = True) -> Dict[str, Any]:
-    graph_additions: List[Dict] = []
+def qa(
+    query: str = Query(..., description="Pergunta do usuário"),
+    top_k: int = Query(6, ge=1, le=50),
+    use_graph: bool = Query(True),
+):
+    """
+    Endpoint principal de QA.
+
+    Retorna:
+      {
+        "query": "...",
+        "passages": [ {title,url,text,score}, ... ],
+        "graph": [ {col: val, ...}, ... ]
+      }
+    """
+    # Busca híbrida (lexical + vetorial se estiver habilitado)
+    candidates = hybrid(query, k_lex=max(top_k * 3, 30), k_vec=0)  # k_vec=0 por enquanto
+
+    # Reordenar (no momento só ordena pelo score mesmo)
+    ranked = rerank(query, candidates, top_k=max(top_k, 10))
+
+    passages = [
+        {
+            "title": d.get("title"),
+            "url": d.get("url"),
+            "text": d.get("text"),
+            "score": float(d.get("score", 0.0)),
+            "section": d.get("section"),
+        }
+        for d in ranked[:top_k]
+    ]
+
+    graph_rows: List[Dict[str, Any]] = []
     if use_graph:
-        ql = query.lower()
-        import re
-        m = re.search(r"disciplines? (?:do|da|de) ([a-z0-9\-\s]+)", ql)
-        if m: graph_additions = related_disciplines(m.group(1).strip())
-        m2 = re.search(r"(?:fac[cç][aã]o|sect) (?:do|da|de) ([a-z0-9\-\s]+)", ql)
-        if m2: graph_additions += factions_of_clan(m2.group(1).strip())
-    candidates = hybrid(query, k_lex=30, k_vec=30)
-    order = rerank(query, candidates, text_key="text", top_k=max(top_k,10))
-    picked = []
-    for idx, score in order[:top_k]:
-        c = dict(candidates[idx]); c["score"]=score; picked.append(c)
-    return {"query":query,"answers":[{"text":d.get("text",""),"title":d.get("title"),"section":d.get("section"),"url":d.get("url"),"score":d.get("score",0.0)} for d in picked],"graph":graph_additions}
+        # Aqui você pode sofisticar com matching de entidades etc.
+        # Por enquanto: se a query mencionar "Ventrue", rodamos um exemplo simples.
+        if "ventrue" in query.lower():
+            cypher = """
+            MATCH (c:Entity {type:"Clan"})-[:REL {rel:"HAS_DISCIPLINE"}]->(d:Entity {type:"Discipline"})
+            WHERE c.id = "Ventrue"
+            RETURN c.id AS clan, collect(d.id)[0..10] AS disciplines
+            """
+            graph_rows = run_cypher(cypher)
+
+    return {
+        "query": query,
+        "passages": passages,
+        "graph": graph_rows,
+    }
 
 @app.get("/graph")
-def graph(query: str):
-    forbidden=["create","merge","delete","set","call dbms","apoc.periodic.commit","load csv"]
-    ql=query.strip().lower()
-    if any(w in ql for w in forbidden): return {"error":"Mutating or unsafe queries are not allowed."}
-    try:
-        with driver.session() as s:
-            rows=[r.data() for r in s.run(query)]
-        return {"query":query,"rows":rows}
-    except Exception as e:
-        return {"error": str(e)}
-
-def _check_admin(x_admin_token: str | None):
-    if not ADMIN_TOKEN or not x_admin_token or x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-from .admin import list_low_confidence, approve_edge, delete_edge, update_edge
-
-@app.get("/admin/edges/low")
-def admin_list_low(limit: int = 100, x_admin_token: str | None = Header(default=None)):
-    _check_admin(x_admin_token); return {"items": list_low_confidence(limit=limit)}
-
-@app.post("/admin/edges/approve")
-def admin_approve(src: str, rel: str, dst: str, x_admin_token: str | None = Header(default=None)):
-    _check_admin(x_admin_token); return approve_edge(src, rel, dst, user="admin")
-
-@app.post("/admin/edges/delete")
-def admin_delete(src: str, rel: str, dst: str, x_admin_token: str | None = Header(default=None)):
-    _check_admin(x_admin_token); return delete_edge(src, rel, dst, user="admin")
-
-@app.post("/admin/edges/update")
-def admin_update(src: str, rel: str, dst: str, new_rel: str | None = None, new_dst: str | None = None, confidence: str | None = None, x_admin_token: str | None = Header(default=None)):
-    _check_admin(x_admin_token); return update_edge(src, rel, dst, new_rel, new_dst, confidence, user="admin")
+def graph(query: str = Query(..., description="Cypher read-only")):
+    """
+    Endpoint genérico de Cypher (read-only).
+    """
+    rows = run_cypher(query)
+    return {"query": query, "rows": rows}

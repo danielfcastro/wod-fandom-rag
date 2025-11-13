@@ -1,13 +1,35 @@
+// ui/src/components/ResultCard.jsx
+export default function ResultCard({ passage }) {
+  const { title, url, text, score, section } = passage
 
-import React from 'react'
-export default function ResultCard({ item }) {
   return (
-    <div className="card space-y-2">
-      <div className="text-sm text-slate-400">{item.title} — <span className="italic">{item.section}</span></div>
-      <div className="whitespace-pre-wrap leading-relaxed">{item.text}</div>
-      <div className="text-sm text-slate-400">
-        Score: {item.score?.toFixed?.(3) ?? '–'} • <a className="link" href={item.url} target="_blank" rel="noreferrer">Fonte</a>
+    <div className="p-4 rounded-xl bg-slate-900 border border-slate-800 shadow-sm">
+      <div className="flex items-baseline justify-between gap-2">
+        <h3 className="text-lg font-semibold text-slate-100">
+          {title || 'Sem título'}
+        </h3>
+        <span className="text-xs text-slate-400">
+          score: {score?.toFixed ? score.toFixed(2) : score}
+        </span>
       </div>
+      {section && (
+        <p className="text-xs text-slate-400 mt-1">
+          Seção: {section}
+        </p>
+      )}
+      <p className="mt-2 text-sm text-slate-200 whitespace-pre-wrap">
+        {text}
+      </p>
+      {url && (
+        <a
+          href={url}
+          target="_blank"
+          rel="noreferrer"
+          className="inline-block mt-3 text-xs text-emerald-400 hover:text-emerald-300"
+        >
+          Ver no Fandom →
+        </a>
+      )}
     </div>
   )
 }
