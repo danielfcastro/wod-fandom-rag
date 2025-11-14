@@ -1,7 +1,7 @@
 import os
 import re
 import hashlib
-from typing import Dict, Iterable, Iterator, List, Tuple, Optional, Union
+from typing import Dict, Iterable, Iterator, List, Tuple, Optional, Union, Any
 
 # --- Fandom API (lista de páginas + parse) ---
 from .fandom_api import iter_allpages, get_parse
@@ -12,8 +12,7 @@ from .indexers.opensearch_index import (
     bulk_upsert as os_bulk_upsert,
 )
 
-# Qdrant pode ter nomes diferentes conforme sua versão do arquivo.
-# Tentamos importar com fallback.
+# Qdrant é opcional: tenta importar, se falhar, segue sem vetor
 _qdrant_upsert = None
 try:
     from .indexers.qdrant_index import bulk_upsert as _qdrant_upsert
@@ -21,11 +20,12 @@ except Exception:
     try:
         from .indexers.qdrant_index import upsert_points as _qdrant_upsert
     except Exception:
-        _qdrant_upsert = None  # vetor opcional
+        _qdrant_upsert = None  # vetorial opcional
 
 # --- Grafo ---
 from .extract_graph import extract as extract_graph
 from .graph.neo4j_store import upsert_nodes, upsert_edges
+
 
 # -----------------------------------------------------------------------------
 # Config
@@ -47,85 +47,61 @@ def _stable_id(*parts: str) -> str:
 
 def _page_url(title: str) -> str:
     base = os.getenv("FANDOM_BASE_URL", "https://whitewolf.fandom.com")
-    # MediaWiki titles → URL
     return f"{base}/wiki/{title.replace(' ', '_')}"
 
 
 # -----------------------------------------------------------------------------
-# Extração de passagens (bem simples, por seções do parse)
+# Extração de passagens (defensiva)
 # -----------------------------------------------------------------------------
-def extract_passages(title: str, parsed: Union[Dict, str]) -> List[Dict]:
+def extract_passages(title: str, parsed: Any) -> List[Dict]:
     """
-    Transforma o resultado do `action=parse` em passagens:
-    - Uma passagem por seção com wikitext "linearizado".
-    - Define um offset incremental para estabilidade.
+    Transforma o resultado de get_parse(title) em passagens.
 
-    `parsed` pode ser:
-      - o JSON completo retornado por `action=parse` (dict)
-      - OU já um wikitext cru (str)
+    - Se parsed vier como dict no formato do action=parse, usa:
+        parsed["parse"]["wikitext"]["*"]  (ou equivalente)
+    - Se vier como string ou qualquer outra coisa, converte para string.
+    - NUNCA chama .get() em algo que não seja dict.
+    - Para simplificar, gera por enquanto apenas uma passagem "Intro"
+      com o texto inteiro.
     """
     passages: List[Dict] = []
 
-    # parsed pode vir como dict (resposta bruta do MediaWiki)
-    # ou já como string (conteúdo plain/wikitext).
-    if isinstance(parsed, str):
-        wikitext = parsed
-        sections = []
+    wikitext = ""
+
+    # Caso 1: parsed é dict no formato padrão do MediaWiki
+    if isinstance(parsed, dict):
+        parse_block = parsed.get("parse") or {}
+        wt = parse_block.get("wikitext")
+
+        # wt pode ser dict {"*": "..."} ou string
+        if isinstance(wt, dict):
+            wikitext = wt.get("*", "") or ""
+        elif isinstance(wt, str):
+            wikitext = wt
+        else:
+            wikitext = ""
     else:
-        wikitext = parsed.get("parse", {}).get("wikitext", {}).get("*", "")
-        sections = parsed.get("parse", {}).get("sections", []) or []
+        # Caso 2: qualquer outra coisa (str, None, etc.)
+        wikitext = str(parsed or "")
 
-    # Mapa index->nome de seção (por enquanto não usamos muito, mas mantemos)
-    sec_names = {
-        int(s.get("index", 0)): s.get("line", "")
-        for s in sections
-        if "index" in s
-    }
+    # Se não vier nada de texto, não há passagens para indexar
+    if not wikitext:
+        return []
 
-    # Estratégia atual:
-    # - Trabalhar com "chunks" de seções, mas como ainda não temos
-    #   um parser de wikitext real plugado aqui, usamos o wikitext
-    #   da página inteira em todas as seções, com uma "Intro".
-    chunks: List[Tuple[str, Optional[str]]] = []
+    body = _norm_space(wikitext)
+    if not body:
+        return []
 
-    if sections:
-        # Cria uma entrada por seção, mas o texto vai ser o mesmo wikitext
-        for s in sections:
-            idx = int(s.get("index", 0))
-            name = s.get("line", "") or f"Section {idx}"
-            chunks.append((name, None))
-
-        if not chunks:
-            chunks = [("Intro", None)]
-    else:
-        chunks = [("Intro", None)]
-
-    # Se houver mais de uma "seção", criamos:
-    # - Intro com o wikitext inteiro
-    # - Demais seções também com o mesmo texto (por enquanto)
-    if chunks and len(chunks) > 1:
-        out: List[Tuple[str, Optional[str]]] = [("Intro", wikitext)]
-        out += [(name, wikitext) for (name, _) in chunks if name != "Intro"]
-        chunks = out
-    else:
-        chunks = [("Intro", wikitext)]
-
-    offset = 0
-    for sec_name, text in chunks:
-        body = _norm_space(text or "")
-        if not body:
-            continue
-        passages.append(
-            {
-                "_id": _stable_id(title, sec_name or "Intro", str(offset)),
-                "title": title,
-                "section": sec_name or "Intro",
-                "url": _page_url(title),
-                "text": body,
-                "offset": offset,
-            }
-        )
-        offset += len(body)
+    passages.append(
+        {
+            "_id": _stable_id(title, "Intro", "0"),
+            "title": title,
+            "section": "Intro",
+            "url": _page_url(title),
+            "text": body,
+            "offset": 0,
+        }
+    )
 
     return passages
 
@@ -135,7 +111,14 @@ def extract_passages(title: str, parsed: Union[Dict, str]) -> List[Dict]:
 # -----------------------------------------------------------------------------
 def ingest_title(title: str):
     """
-    Retorna tupla (os_docs, qdrant_pts, graph_edges)
+    Processa um título:
+      - chama get_parse(title)
+      - extrai passagens
+      - upsert em OpenSearch (sempre)
+      - upsert em Qdrant (se configurado)
+      - atualiza grafo em Neo4j (se extract_graph retornar algo)
+
+    Retorna tupla (os_docs, qdrant_pts, graph_edges).
     """
     # 1) parse
     parsed = get_parse(title)
@@ -147,6 +130,7 @@ def ingest_title(title: str):
 
     # 3) upsert OpenSearch (sempre)
     os_bulk_upsert(passages)
+    os_cnt = len(passages)
 
     # 4) upsert Qdrant (se disponível)
     qdr_cnt = 0
@@ -159,6 +143,7 @@ def ingest_title(title: str):
             print(f"[WARN] Qdrant upsert falhou em '{title}': {e}")
 
     # 5) grafo (nodes, edges)
+    g_edges = 0
     try:
         nodes, edges = extract_graph(title, parsed)
         if nodes:
@@ -168,9 +153,8 @@ def ingest_title(title: str):
         g_edges = len(edges or [])
     except Exception as e:
         print(f"[WARN] Grafo falhou em '{title}': {e}")
-        g_edges = 0
 
-    return (len(passages), qdr_cnt, g_edges)
+    return (os_cnt, qdr_cnt, g_edges)
 
 
 # -----------------------------------------------------------------------------
@@ -179,9 +163,9 @@ def ingest_title(title: str):
 def main():
     import argparse
 
-    os_ensure_index()  # garante o índice lexical
+    os_ensure_index()  # garante o índice lexical em OpenSearch
 
-    ap = argparse.ArgumentParser("Ingestor Fandom → OS/Qdrant/Neo4j")
+    ap = argparse.ArgumentParser("Ingestor Fandom -> OpenSearch/Qdrant/Neo4j")
     ap.add_argument("--mode", choices=["title", "allpages"], default="allpages")
     ap.add_argument("--title", type=str, help="Título único (mode=title)")
     ap.add_argument(
@@ -213,6 +197,7 @@ def main():
         except Exception as e:
             print(f"[WARN] ingest_title('{title}') falhou: {e}")
         total = i
+
     print(f"[done] processados: {total}")
 
 

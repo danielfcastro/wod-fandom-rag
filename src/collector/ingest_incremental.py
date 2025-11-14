@@ -1,13 +1,15 @@
 # src/collector/ingest_incremental.py
 import os
+import sys
+import time
 import signal
 import sqlite3
 import argparse
+import subprocess
 from datetime import datetime
 from typing import Iterable, List
 
 from .fandom_api import iter_allpages
-from .run_ingest import ingest_title  # usa o mesmo fluxo de ingestão de 1 título
 
 # --- OpenSearch: checar existência por title (keyword) ---
 from opensearchpy import OpenSearch
@@ -153,6 +155,26 @@ def pending_titles(con, limit: int, max_retries: int) -> List[str]:
     return [r[0] for r in cur.fetchall()]
 
 
+def process_title_via_cli(title: str):
+    """
+    Chama o mesmo fluxo que você já usa:
+
+        python -m src.collector.run_ingest --mode title --title <title>
+
+    Se der erro, levanta subprocess.CalledProcessError.
+    """
+    cmd = [
+        sys.executable,
+        "-m",
+        "src.collector.run_ingest",
+        "--mode",
+        "title",
+        "--title",
+        title,
+    ]
+    subprocess.run(cmd, check=True)
+
+
 def run(
     namespace: int,
     limit: int,
@@ -230,11 +252,11 @@ def run(
                 continue
 
             try:
-                # usa o mesmo fluxo de ingestão de 1 título
-                ingest_title(title)
+                process_title_via_cli(title)
                 page_set(con, title, "ok", reset_tries=True)
                 ok += 1
             except Exception as e:
+                print(f"[ERROR] falhou em '{title}': {repr(e)}", flush=True)
                 page_set(con, title, "failed", err=repr(e))
                 err += 1
 
